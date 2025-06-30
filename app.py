@@ -1,233 +1,358 @@
-import streamlit as st
+# linkedin_company_finder.py
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import os
+import re
+import time
+from typing import Any, Dict, List, Tuple
+from urllib.parse import urlsplit
+
 import pandas as pd
 import requests
-from requests.exceptions import HTTPError, Timeout, RequestException
-from urllib.parse import urlsplit, urlunsplit
+import streamlit as st
+from openai import OpenAI, OpenAIError
+from requests.exceptions import HTTPError, RequestException, Timeout
 
-st.set_page_config(
-    page_title="🔗 LinkedIn → Company Website Finder",
-    layout="wide"
-)
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+SCRAPINGDOG_URL   = "https://api.scrapingdog.com/linkedin"
+SCRAPINGDOG_API_KEY: str | None = None
 
-# — SIDEBAR: API Key —
-with st.sidebar:
-    st.markdown("## 🔑 API Configuration")
-    api_key = st.text_input(
-        "ScrapingDog API Key",
-        type="password",
-        help="Find this in your ScrapingDog dashboard."
+OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL      = "gpt-4o-mini"
+LLM_TIMEOUT       = 20
+EXPERIENCE_LIMIT  = 3
+SCRAPINGDOG_DELAY = 1.1   # seconds between calls
+
+client: OpenAI | None = None           # set after user types key
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers – run with timeout
+# ─────────────────────────────────────────────────────────────────────────────
+def _with_timeout(fn, seconds: int):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(fn)
+        try:
+            return fut.result(timeout=seconds)
+        except concurrent.futures.TimeoutError:
+            fut.cancel()
+            raise Timeout(f"LLM call exceeded {seconds}s")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM helper
+# ─────────────────────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """
+You must output exactly ONE item:
+
+• a LinkedIn company URL that appears verbatim in the records, with no query
+  parameters or fragments, e.g. https://www.linkedin.com/company/example
+    –OR–
+• the single word: None
+
+No other text. The company must clearly work in web-design, web-development,
+software development, SaaS, or an adjacent tech field.
+""".strip()
+
+def build_user_prompt(exps: List[Dict[str, Any]]) -> str:
+    """Return the raw JSON-string of the 3 experience objects."""
+    return json.dumps(exps, ensure_ascii=False)  # <-- no pretty-printing
+
+def call_llm(user_prompt: str) -> str:
+    if client is None:
+        raise OpenAIError("OpenAI client not initialised.")
+    r = client.chat.completions.create(
+        model       = OPENAI_MODEL,
+        messages    = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": user_prompt},
+        ],
+        temperature = 0.0,
+        max_tokens  = 32,
     )
-    st.markdown("---")
-    st.info("Add your key above, then select Single or Batch entry.")
+    return r.choices[0].message.content.strip()
 
-if not api_key:
-    st.warning("⚠️ Please enter your ScrapingDog API key in the sidebar.")
-    st.stop()
-
-
-def call_scrapingdog(link_type: str, link_id: str) -> dict:
+def llm_pick_company_url(exps: List[Dict[str, Any]]) -> Tuple[str | None, str, str]:
     """
-    Call the ScrapingDog API for either 'profile' or 'company'.
-    Returns JSON dict on success, or raises HTTPError / ValueError.
+    Returns:
+        cleaned_url | None,
+        raw_reply,
+        user_prompt (the JSON string we sent)
     """
-    endpoint = "https://api.scrapingdog.com/linkedin"
+    if not exps:
+        return None, "(no experiences)", "[]"
+
+    user_prompt = build_user_prompt(exps)
+
+    try:
+        raw_reply = _with_timeout(lambda: call_llm(user_prompt), LLM_TIMEOUT)
+    except Exception as exc:
+        return None, f"(OpenAI error: {exc})", user_prompt
+
+    cleaned = (
+        raw_reply.split("?", 1)[0].split("#", 1)[0].rstrip("/").strip()
+        if raw_reply.lower() != "none" else None
+    )
+    return cleaned, raw_reply, user_prompt
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ScrapingDog helper
+# ─────────────────────────────────────────────────────────────────────────────
+def call_scrapingdog(api_key: str, link_type: str, link_id: str) -> Dict[str, Any]:
     params = {
         "api_key": api_key,
-        "type": link_type,
-        "linkId": link_id,
-        "private": "false"
+        "type"   : link_type,
+        "linkId" : link_id,
+        "private": "false",
     }
     try:
-        resp = requests.get(endpoint, params=params, timeout=10)
-        # Handle specific HTTP errors
-        if resp.status_code == 401:
-            raise HTTPError("401 Unauthorized – check your API key", response=resp)
-        if resp.status_code == 429:
-            raise HTTPError("429 Too Many Requests – rate limit reached", response=resp)
-        resp.raise_for_status()
-        return resp.json()
-    except Timeout:
-        raise Timeout("The request timed out. Please try again later.")
-    except HTTPError as http_err:
-        raise HTTPError(str(http_err))
-    except ValueError:
-        raise ValueError("Invalid JSON response from ScrapingDog.")
-    except RequestException as e:
-        raise RequestException(f"Network error: {e}")
+        resp = requests.get(SCRAPINGDOG_URL, params=params, timeout=30)
+    except (Timeout, RequestException) as exc:
+        raise RuntimeError(f"ScrapingDog network error: {exc}")
 
+    if resp.status_code == 401:
+        raise RuntimeError("ScrapingDog 401 – bad key")
+    if resp.status_code == 429:
+        raise RuntimeError("ScrapingDog 429 – rate limit")
 
-def get_company_info(profile_url: str) -> dict:
-    """
-    Given a LinkedIn profile URL, returns a dict with:
-      first_name, last_name, profile_url,
-      company_name, company_linkedin_url, company_website.
-    On any error, returns {'error': <message>}.
-    """
-    # Validate and parse profile URL
+    resp.raise_for_status()
+    data = resp.json()
+    return data[0] if isinstance(data, list) and data else data
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Website extraction
+# ─────────────────────────────────────────────────────────────────────────────
+_WEBSITE_KEYS = ("website", "website_url", "url", "homepage", "site")
+
+def _looks_like_site(s: str | None) -> bool:
+    if not isinstance(s, str):
+        return False
+    s = s.strip()
+    return (
+        s.startswith(("http://", "https://", "www."))
+        and not any(dom in s for dom in ("linkedin.com", "licdn.com"))
+        and not re.search(r"\.(png|jpe?g|gif|svg)$", s, re.I)
+    )
+
+def _normalise_site(s: str) -> str:
+    s = s.strip().rstrip("/")
+    if s.startswith(("http://", "https://")):
+        return s
+    if s.startswith("www."):
+        return f"https://{s}"
+    return s
+
+def extract_company_website(raw: Any) -> str | None:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+
+    if isinstance(raw, dict):
+        for k in _WEBSITE_KEYS:
+            v = raw.get(k)
+            if _looks_like_site(v):
+                return _normalise_site(v)
+
+    def _crawl(o):
+        if isinstance(o, str) and _looks_like_site(o):
+            return _normalise_site(o)
+        if isinstance(o, dict):
+            for v in o.values():
+                r = _crawl(v)
+                if r:
+                    return r
+        if isinstance(o, list):
+            for v in o:
+                r = _crawl(v)
+                if r:
+                    return r
+        return None
+
+    return _crawl(raw)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main pipeline for one profile
+# ─────────────────────────────────────────────────────────────────────────────
+def serialise(obj: Any) -> str:
+    if isinstance(obj, (dict, list)):
+        return json.dumps(obj, ensure_ascii=False)
+    return str(obj)
+
+def get_company_info(profile_url: str, sd_key: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"profile_url": profile_url}
+
     try:
-        parts = urlsplit(profile_url)
-        segs = [s for s in parts.path.split('/') if s]
-        if len(segs) < 2 or segs[0] != 'in':
-            raise ValueError
-        profile_id = segs[1]
-    except Exception:
-        return {"error": "Invalid LinkedIn profile URL format."}
+        parts = [p for p in urlsplit(profile_url).path.split("/") if p]
+        if len(parts) < 2 or parts[0] != "in":
+            raise ValueError("Invalid profile URL")
+        profile_id = parts[1]
 
-    # Fetch profile data
+        person = call_scrapingdog(sd_key, "profile", profile_id)
+        time.sleep(SCRAPINGDOG_DELAY)
+
+    except Exception as exc:
+        out["error"] = f"Profile scrape error: {exc}"
+        return out
+
+    exps = person.get("experience", [])[:EXPERIENCE_LIMIT]
+    url_clean, raw_reply, user_prompt = llm_pick_company_url(exps)
+
+    out.update({
+        "experiences_json"    : serialise(exps),
+        "llm_system_prompt"   : SYSTEM_PROMPT,
+        "llm_user_prompt"     : user_prompt,
+        "llm_response_raw"    : raw_reply,
+        "cleaned_llm_url"     : url_clean or "",
+    })
+
+    if not url_clean:
+        out["error"] = "LLM returned None or unusable URL"
+        return out
+
+    def _clean(u: str) -> str:
+        return u.split("?", 1)[0].split("#", 1)[0].rstrip("/").lower()
+
+    chosen_exp = next(
+        (e for e in exps if _clean(str(e.get("company_url", ""))) == url_clean.lower()),
+        None
+    )
+    out["chosen_experience_json"] = serialise(chosen_exp) if chosen_exp else ""
+
     try:
-        pdata = call_scrapingdog('profile', profile_id)
-        prof = pdata[0] if isinstance(pdata, list) and pdata else pdata
-    except Exception as e:
-        return {"error": f"Profile fetch error: {e}"}
+        segs = [p for p in urlsplit(url_clean).path.split("/") if p]
+        cid  = segs[segs.index("company") + 1]
+        comp = call_scrapingdog(sd_key, "company", cid)
+        time.sleep(SCRAPINGDOG_DELAY)
 
-    # Extract name
-    first = prof.get('firstName') or ''
-    last = prof.get('lastName') or ''
-    if not (first and last):
-        full = prof.get('fullName', '')
-        parts = full.split()
-        first = first or (parts[0] if parts else '')
-        last = last or (parts[-1] if len(parts) > 1 else '')
+        site = extract_company_website(comp)
+        out.update({
+            "company_linkedin"   : url_clean,
+            "company_json"       : serialise(comp),
+            "company_website"    : site or "",
+            "error"              : None if site else "Website not found in company JSON",
+        })
 
-    # Extract raw company link
-    raw = prof.get('description', {}).get('description1_link')
-    if not raw:
-        return {"error": "No current company link found in profile."}
+    except Exception as exc:
+        out.update({
+            "company_json"    : "{}",
+            "company_website" : "",
+            "error"           : f"Company scrape error: {exc}",
+        })
 
-    # Normalize company page URL
-    sp = urlsplit(raw)
-    comp_page = urlunsplit((sp.scheme, sp.netloc, sp.path, '', ''))
+    return out
 
-    # Parse company ID
-    try:
-        csegs = [s for s in urlsplit(comp_page).path.split('/') if s]
-        idx = csegs.index('company')
-        company_id = csegs[idx + 1]
-    except Exception:
-        return {"error": "Could not extract company identifier from URL."}
+# ─────────────────────────────────────────────────────────────────────────────
+# STREAMLIT UI
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="🔗 LinkedIn → Company Website Finder", layout="wide")
 
-    # Fetch company data
-    try:
-        cdata = call_scrapingdog('company', company_id)
-        comp = cdata[0] if isinstance(cdata, list) and cdata else cdata
-    except Exception as e:
-        return {"error": f"Company fetch error: {e}"}
+with st.sidebar:
+    st.markdown("## 🔑 API Keys")
+    SCRAPINGDOG_API_KEY = st.text_input("ScrapingDog API Key", type="password", value=SCRAPINGDOG_API_KEY or "")
+    OPENAI_API_KEY      = st.text_input("OpenAI API Key",      type="password", value=OPENAI_API_KEY or "")
+    if OPENAI_API_KEY:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+    st.markdown("---")
+    st.info("Enter keys, then choose a mode.")
 
-    return {
-        'first_name': first,
-        'last_name': last,
-        'profile_url': profile_url,
-        'company_name': comp.get('company_name', ''),
-        'company_linkedin_url': f"https://www.linkedin.com/company/{company_id}",
-        'company_website': comp.get('website', '')
-    }
+if not SCRAPINGDOG_API_KEY or client is None:
+    st.stop()
 
-# — TABS —
-tab1, tab2 = st.tabs(["🔍 Single Entry", "🗃️ Batch Entry"])
+single_tab, batch_tab = st.tabs(["🔍 Single Profile", "🗃️ Batch CSV"])
 
-with tab1:
+# ── Single profile ───────────────────────────────────────────────────────────
+with single_tab:
     st.header("Single Profile Lookup")
-    c1, c2 = st.columns([1, 2], gap="large")
+    p_url = st.text_input("LinkedIn Profile URL", placeholder="https://www.linkedin.com/in/username")
 
-    with c1:
-        profile_url = st.text_input(
-            "LinkedIn Profile URL",
-            placeholder="https://www.linkedin.com/in/username"
-        )
-        fetch = st.button("Fetch Company Info")
-
-    with c2:
-        if fetch:
-            if not profile_url:
-                st.error("Please enter a LinkedIn profile URL.")
-            else:
-                with st.spinner("Fetching data…"):
-                    info = get_company_info(profile_url)
-                if info.get('error'):
-                    st.error(info['error'])
-                else:
-                    st.success("✅ Data retrieved")
-                    st.markdown("**👤 Person**")
-                    st.write("First Name:", info['first_name'])
-                    st.write("Last Name:", info['last_name'])
-                    st.write("Profile:", info['profile_url'])
-                    st.markdown("**🏢 Company**")
-                    st.write("Name:", info['company_name'])
-                    st.write("LinkedIn:", info['company_linkedin_url'])
-                    st.write("Website:", info['company_website'])
-
-with tab2:
-    st.header("Batch CSV Lookup")
-    left, right = st.columns([1, 2], gap="large")
-
-    with left:
-        uploaded = st.file_uploader(
-            "Upload CSV",
-            type="csv",
-            help="Must contain a column of LinkedIn profile URLs."
-        )
-        if uploaded:
-            try:
-                df = pd.read_csv(uploaded)
-                if df.empty:
-                    st.error("Uploaded CSV is empty.")
-                    uploaded = None
-            except Exception:
-                st.error("Failed to read CSV. Check file format.")
-                uploaded = None
-
-        if uploaded:
-            linkedin_col = st.selectbox(
-                "Select LinkedIn URL column",
-                options=df.columns
-            )
-            # Validate selected column for URLs
-            sample = df[linkedin_col].dropna().astype(str).head(5)
-            valid_count = sample.str.startswith('http').sum()
-            if valid_count == 0:
-                st.error("Selected column contains no valid URLs. Please choose a different column.")
-                run_batch = False
-            else:
-                max_rows = st.number_input(
-                    "Rows to process",
-                    min_value=1,
-                    max_value=len(df),
-                    value=min(20, len(df))
-                )
-                run_batch = st.button("Run Batch")
+    if st.button("Fetch"):
+        if not p_url:
+            st.error("Please enter a URL.")
         else:
-            run_batch = False
+            with st.spinner("Processing …"):
+                info = get_company_info(p_url.strip(), SCRAPINGDOG_API_KEY)
+            if info.get("error"):
+                st.error(info["error"])
+            st.json(info)
 
-    with right:
-        if uploaded:
-            st.markdown("#### Input Preview")
-            st.dataframe(df.head(), use_container_width=True)
+# ── Batch CSV ────────────────────────────────────────────────────────────────
+with batch_tab:
+    st.header("Batch CSV Lookup")
+    up_file = st.file_uploader(
+        "Upload CSV",
+        type="csv",
+        help="Select the column that contains the LinkedIn profile URLs."
+    )
 
-        if uploaded and run_batch:
-            results = []
-            with st.spinner(f"Processing up to {max_rows} rows…"):
-                for _, row in df.head(max_rows).iterrows():
-                    url = row.get(linkedin_col, '')
-                    if not isinstance(url, str) or not url.startswith('http'):
-                        continue
-                    try:
-                        info = get_company_info(url)
-                    except Exception:
-                        continue
-                    if info.get('error') or not info.get('company_website'):
-                        continue
+    if up_file is not None:
+        try:
+            df_in = pd.read_csv(up_file)
+        except Exception as e:
+            st.error(f"Could not read CSV: {e}")
+            st.stop()
+
+        if df_in.empty:
+            st.error("The uploaded CSV is empty.")
+            st.stop()
+
+        candidates = [c for c in df_in.columns if re.search(r"url|linkedin", c, re.I)]
+        default_idx = df_in.columns.get_loc(candidates[0]) if candidates else 0
+
+        url_col = st.selectbox(
+            "Column containing LinkedIn profile URLs",
+            df_in.columns,
+            index=default_idx
+        )
+
+        max_rows = st.number_input(
+            "Rows to process",
+            min_value=1,
+            max_value=len(df_in),
+            value=min(1000, len(df_in)),
+        )
+
+        if st.button("Run Batch"):
+            results: List[Dict[str, Any]] = []
+            progress = st.progress(0.0)
+            total = int(max_rows)
+            start = time.time()
+
+            with st.spinner(f"Processing {total} profiles …"):
+                for i, url in enumerate(df_in[url_col].head(total), start=1):
+                    info = get_company_info(str(url).strip(), SCRAPINGDOG_API_KEY)
                     results.append(info)
+                    progress.progress(i / total)
+                    time.sleep(0.2)  # small delay
 
-            if not results:
-                st.warning("No valid data found to process.")
-            else:
-                out_df = pd.DataFrame(results)
-                st.markdown("#### Results")
-                st.dataframe(out_df, use_container_width=True)
-                csv_bytes = out_df.to_csv(index=False).encode('utf-8')
+            progress.empty()
+            elapsed = time.time() - start
+
+            df_full = pd.DataFrame(results)
+            successes = df_full[df_full["error"].isna()]
+
+            st.success(
+                f"Finished in {elapsed:.1f}s – "
+                f"{len(successes)} successes, {len(df_full) - len(successes)} errors."
+            )
+
+            if not successes.empty:
                 st.download_button(
-                    "⬇️ Download Results CSV",
-                    data=csv_bytes,
+                    "⬇️ Download Successes CSV",
+                    data=successes.to_csv(index=False).encode("utf-8"),
                     file_name="linkedin_company_websites.csv",
-                    mime="text/csv"
+                    mime="text/csv",
                 )
+
+            st.download_button(
+                "⬇️ Download Detailed Debug CSV",
+                data=df_full.to_csv(index=False).encode("utf-8"),
+                file_name="linkedin_debug_full.csv",
+                mime="text/csv",
+            )
+
+            st.markdown("#### Debug preview (first 10 rows)")
+            st.dataframe(df_full.head(10), use_container_width=True)
