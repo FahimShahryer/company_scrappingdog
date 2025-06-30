@@ -123,7 +123,8 @@ def scrape_and_classify(linkedin_url: str) -> dict[str, str]:
                     break
     except json.JSONDecodeError:
         pass
-
+    
+    slug = "" 
     if agency_url:
         m = re.search(r"https://www\.linkedin\.com/company/([^/?]+)", agency_url)
         if m:
