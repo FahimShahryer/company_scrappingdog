@@ -229,7 +229,7 @@ def process_rows(df: pd.DataFrame, url_col: str, start: int, end: int) -> pd.Dat
 # Streamlit UI
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config("LinkedIn Experience Scraper + Classifier", "🔗")
-st.title("🔗 LinkedIn Experience Scraper + Web-Design-Agency Classifier")
+# st.title("🔗 LinkedIn Experience Scraper + Web-Design-Agency Classifier")
 
 uploaded = st.file_uploader("Upload a CSV file", type=["csv"])
 if uploaded:
