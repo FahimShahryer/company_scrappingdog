@@ -238,36 +238,61 @@ if uploaded:
 
     url_col = st.selectbox("Column with LinkedIn profile URLs", df.columns.tolist())
 
-    col1, col2 = st.columns(2)
-    with col1:
-        start_row = st.number_input(
-            "Start row (1-based)", 1, len(df), 1, 1, format="%i"
-        )
-    with col2:
-        end_row = st.number_input(
-            "End row (inclusive)", 1, len(df), len(df), 1, format="%i"
+        # 🔄 Entire body UI rewritten as two-column layout
+    left_col, right_col = st.columns(2)
+
+    # ——— LEFT  : all configuration & action button ———
+    with left_col:
+        st.markdown("### 🔧 Configuration")
+
+        url_col = st.selectbox(
+            "Column with LinkedIn profile URLs", df.columns.tolist()
         )
 
-    if start_row > end_row:
-        st.warning("Start row must be ≤ end row.")
-        st.stop()
+        r1, r2 = st.columns(2)
+        with r1:
+            start_row = st.number_input(
+                "Start row (1-based)", 1, len(df), 1, 1, format="%i"
+            )
+        with r2:
+            end_row = st.number_input(
+                "End row (inclusive)", 1, len(df), len(df), 1, format="%i"
+            )
 
-    if st.button(
-        f"Scrape & Classify rows {start_row}-{end_row}",
-        type="primary",
-        help="Consumes ScrapingDog + OpenAI credits.",
-    ):
+        run_btn = st.button(
+            f"🚀 Scrape & Classify rows {start_row}-{end_row}",
+            type="primary",
+            help="Consumes ScrapingDog + OpenAI credits.",
+            use_container_width=True,
+        )
+
+    # ——— RIGHT : live preview (dataset first, results later) ———
+    with right_col:
+        st.markdown("### 📄 Dataset preview")
+        st.dataframe(df.head())
+
+    # ——— When the user clicks the button ———
+    if run_btn:
+        if start_row > end_row:
+            st.warning("Start row must be ≤ end row.")
+            st.stop()
+
         with st.spinner("Working…"):
             result_df = process_rows(df, url_col, start_row, end_row)
 
         st.success(f"Done! Parsed {len(result_df)} profiles.")
-        st.dataframe(result_df.head())
 
-        out_path = Path("linkedin_experiences_classified.csv")
-        result_df.to_csv(out_path, index=False, encoding="utf-8")
-        st.download_button(
-            label="⬇️ Download CSV with LLM column",
-            data=out_path.read_bytes(),
-            mime="text/csv",
-            file_name=out_path.name,
-        )
+        with right_col:
+            st.markdown("### 📑 Output preview")
+            st.dataframe(result_df.head())
+
+            out_path = Path("linkedin_experiences_classified.csv")
+            result_df.to_csv(out_path, index=False, encoding="utf-8")
+            st.download_button(
+                label="⬇️ Download CSV with LLM column",
+                data=out_path.read_bytes(),
+                mime="text/csv",
+                file_name=out_path.name,
+                use_container_width=True,
+            )
+
