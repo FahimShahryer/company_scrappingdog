@@ -236,7 +236,7 @@ if uploaded:
     df = pd.read_csv(uploaded)
     st.success(f"Loaded {len(df):,} rows.")
 
-    url_col = st.selectbox("Column with LinkedIn profile URLs", df.columns.tolist())
+    
 
         # 🔄 Entire body UI rewritten as two-column layout
     left_col, right_col = st.columns(2)
