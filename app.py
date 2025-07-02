@@ -1,50 +1,79 @@
 # linkedin_experience_scraper.py
 # Upload CSV → choose URL column & slice → scrape LinkedIn experiences →
-# GPT-4.1 mini labels every employer as web-design-agency yes/no →
-# download enriched CSV
+# GPT-4.1* labels every employer as web-design-agency yes/no → download enriched CSV
 
 from __future__ import annotations
-import json, re, time, concurrent.futures, requests
-from pathlib import Path
-from typing import Any, Dict, List
 
+import concurrent.futures, json, re, time, requests
+from pathlib import Path
+from typing import Any
+
+import openai
 import pandas as pd
 import streamlit as st
 from requests.exceptions import HTTPError, Timeout, RequestException
-import openai
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SETTINGS
+# UI – sidebar for credentials & model
 # ─────────────────────────────────────────────────────────────────────────────
-SCRAPINGDOG_API_KEY = "685ec4c35257ed02ae0575b4"
-SCRAPINGDOG_URL     = "https://api.scrapingdog.com/linkedin/"
-THREADS             = 6
-PER_REQUEST_DELAY   = 1.1
-TIMEOUT_SECONDS     = 25
+with st.sidebar:
+    st.header("🔑 API credentials")
+    sd_key_input = st.text_input(
+        "ScrapingDog API key", type="password",
+        value=st.session_state.get("scrapingdog_key", "")
+    )
+    oa_key_input = st.text_input(
+        "OpenAI API key", type="password",
+        value=st.session_state.get("openai_key", "")
+    )
 
-OPENAI_API_KEY = (
-    "sk-proj-7Qh2v2-y-AhZVEwYuIQzs46LlA6Hv8rULYG1TuOJ7JC4ttaVGDSUx1Qpbc8WWwC31ynS_"
-    "GJLcPT3BlbkFJ7BGx05ky7mfDpC4V_uOXV9hKYRPHkRs-R4Utm9kF30wjUQxz61JnJDi_cgYMbe8-"
-    "x_ugka3pQA"
-)
-OPENAI_MODEL   = "gpt-4.1-mini"
-OPENAI_TEMP    = 0
-OPENAI_TIMEOUT = 45
+    st.divider()
+    st.subheader("⚙️ OpenAI model")
+    model_options  = ["gpt-4.1-nano", "gpt-4.1-mini", "gpt-4.1"]
+    default_model  = st.session_state.get("openai_model", "gpt-4.1-nano")
+    model_choice   = st.selectbox("Choose model", model_options,
+                                  index=model_options.index(default_model))
+
+    if st.button("💾 Save credentials", type="primary"):
+        st.session_state["scrapingdog_key"] = sd_key_input.strip()
+        st.session_state["openai_key"]      = oa_key_input.strip()
+        st.session_state["openai_model"]    = model_choice
+        st.success("Saved! You can close the sidebar.")
+
+# Block remainder of app until mandatory keys exist
+if not st.session_state.get("scrapingdog_key") or not st.session_state.get("openai_key"):
+    st.warning("Enter both API keys in the sidebar, then press **Save credentials**.")
+    st.stop()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SETTINGS (pulled from session_state)
+# ─────────────────────────────────────────────────────────────────────────────
+SCRAPINGDOG_API_KEY: str = st.session_state["scrapingdog_key"]
+SCRAPINGDOG_URL      = "https://api.scrapingdog.com/linkedin/"
+THREADS              = 6
+PER_REQUEST_DELAY    = 1.1
+TIMEOUT_SECONDS      = 25
+
+OPENAI_API_KEY: str  = st.session_state["openai_key"]
+OPENAI_MODEL:  str   = st.session_state["openai_model"]    # user-selected
+OPENAI_TEMP          = 0
+OPENAI_TIMEOUT       = 45
 
 openai.api_key = OPENAI_API_KEY
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompt
+# ─────────────────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
     "You will receive a JSON array of job-experience objects scraped from LinkedIn.\n\n"
-    "Task\n"
-    "────\n"
+    "Task\n────\n"
     "• Evaluate every employer and decide **at most one** company that is clearly a "
-    "web-design / web-development agency (or broader digital studio that sells website work).\n"
+    "web-design / web-development agency (or broader digital agency that sells website work also).\n"
     "• If such a strongest match exists, mark that single company with "
     "\"isWebDesignAgency\": \"yes\" and mark **all others** \"no\".\n"
     "• If none qualify, mark **all** companies \"no\".\n"
     "• ↺ Exactly one \"yes\" *or* zero \"yes\"; **never more than one**.\n\n"
-    "Output\n"
-    "──────\n"
+    "Output\n──────\n"
     "Return a JSON array **in the same order you received**. Each element must contain only:\n"
     "{\n"
     "  \"companyName\":        \"<string>\",\n"
@@ -54,7 +83,6 @@ SYSTEM_PROMPT = (
     "}\n\n"
     "Provide no extra keys and no commentary before or after the array."
 )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -67,12 +95,8 @@ def extract_linkid(url: str) -> str:
         raise ValueError("Couldn’t detect linkId in URL")
     return m.group(1).strip()
 
-# ───────── replace the helper with the new signature ─────────
 def call_llm(profile_payload: dict[str, Any]) -> str:
-    """
-    Send {"experiences": [...], "description": "..."} to GPT-4.1 mini and
-    return its JSON string (or 'LLM_ERROR: …' if something fails).
-    """
+    """Send payload to OpenAI and return JSON string (or 'LLM_ERROR: …')."""
     try:
         resp = openai.chat.completions.create(
             model       = OPENAI_MODEL,
@@ -87,11 +111,8 @@ def call_llm(profile_payload: dict[str, Any]) -> str:
     except Exception as e:
         return f"LLM_ERROR: {e!s}"
 
-
 def scrape_and_classify(linkedin_url: str) -> dict[str, str]:
-    """
-    Scrape LinkedIn → run LLM → return dict for DataFrame row.
-    """
+    """Scrape LinkedIn → run LLM → return dict for DataFrame row."""
     link_id = extract_linkid(linkedin_url)
     params  = {"api_key": SCRAPINGDOG_API_KEY, "type": "profile", "linkId": link_id}
 
@@ -123,25 +144,21 @@ def scrape_and_classify(linkedin_url: str) -> dict[str, str]:
                     break
     except json.JSONDecodeError:
         pass
-    
-    slug = "" 
+
+    slug = ""
     if agency_url:
         m = re.search(r"https://www\.linkedin\.com/company/([^/?]+)", agency_url)
         if m:
             agency_url = f"https://www.linkedin.com/company/{m.group(1)}"
-            slug = m.group(1)                         # ← new
-        else:
-            slug = ""
-
+            slug = m.group(1)
 
     company_website = ""
-    if slug: 
-        
+    if slug:
         try:
             params2 = {
                 "api_key": SCRAPINGDOG_API_KEY,
                 "type":    "company",
-                "linkId":  slug,     # full LinkedIn company URL
+                "linkId":  slug,
                 "private": "false",
             }
             r2 = requests.get(SCRAPINGDOG_URL, params=params2, timeout=TIMEOUT_SECONDS)
@@ -168,7 +185,7 @@ def process_rows(df: pd.DataFrame, url_col: str, start: int, end: int) -> pd.Dat
 
     results: list[dict] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as ex:
-        futures = {ex.submit(scrape_and_classify, u): u for u in urls}
+        futures  = {ex.submit(scrape_and_classify, u): u for u in urls}
         progress = st.progress(0.0)
         for idx, fut in enumerate(concurrent.futures.as_completed(futures), start=1):
             progress.progress(idx / len(urls))
